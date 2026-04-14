@@ -1,0 +1,14 @@
+{
+    "mcpServers": {
+        "FileOrganizerAgent": {
+            "command": "/path/to/CLI-File-Agent/.venv/bin/python",
+            "args": [
+                "/path/to/CLI-File-Agent/mcp_server.py"
+            ],
+            "disabled": false,
+            "alwaysAllow": [
+                "organize_files_dry_run"
+            ]
+        }
+    }
+}

@@ -1,0 +1,9 @@
+.env
+*/__pycache__/
+.venv/
+.env.*
+!.env.example
+.DS_Store
+.agent_history.json
+.agent_metadata.json
+mcp_settings.local.json
