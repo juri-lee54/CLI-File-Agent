@@ -1,0 +1,14 @@
+{
+    "mcpServers": {
+        "FileOrganizerAgent": {
+            "command": "/Users/jurilee/workspace/WooriFISA/semina2/file_agent/.venv/bin/python",
+            "args": [
+                "/Users/jurilee/workspace/WooriFISA/semina2/file_agent/mcp_server.py"
+            ],
+            "disabled": false,
+            "alwaysAllow": [
+                "organize_files_dry_run"
+            ]
+        }
+    }
+}
