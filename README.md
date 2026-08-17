@@ -1,4 +1,4 @@
-# 🗂️ File Organizer AI Agent (v2)
+# 🗂️ File Organizer AI Agent 
 
 단순히 확장자(`*.txt`, `*.jpg`)에 의존해 폴더를 분류하는 기존의 방식을 넘어선 **진정한 형태의 지능형 파일 정리 에이전트**입니다. 
 
