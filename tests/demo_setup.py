@@ -441,8 +441,48 @@ def create_demo_environment():
         preview = content.strip().split('\n')[0][:38]
         print(f"  ✓ {filename:25s}  \"{preview}\"")
 
+    # ── 멀티모달 파일 생성 (DOCX, XLSX, JPG) ────────────────────────
+    try:
+        import docx
+        doc = docx.Document()
+        doc.add_heading("2024년 3분기 프리랜서 용역 계약서", 0)
+        doc.add_paragraph("본 계약은 클라이언트 A와 개발자 간의 소프트웨어 개발 용역을 규정합니다.")
+        doc.add_paragraph("보수 지급액: 총 5,000,000원 (선금 50%, 잔금 50%)")
+        table = doc.add_table(rows=2, cols=2)
+        table.rows[0].cells[0].text = "프로젝트명"
+        table.rows[0].cells[1].text = "AI 파일 정리기 개발"
+        table.rows[1].cells[0].text = "납기일"
+        table.rows[1].cells[1].text = "2024-10-31"
+        doc.save(str(demo_path / "contract_q3.docx"))
+        print(f"  ✓ {'contract_q3.docx':25s}  \"[Word 문서] 3분기 프리랜서 용역 계약서\"")
+    except Exception as e:
+        print(f"  ⚠️ Word 파일 생성 생략 ({e})")
+
+    try:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "매출현황"
+        ws.append(["날짜", "항목", "금액", "결제상태"])
+        ws.append(["2024-08-01", "서버 호스팅 비용", -150000, "완료"])
+        ws.append(["2024-08-15", "신규 프로젝트 수임료", 5000000, "완료"])
+        ws.append(["2024-09-01", "사무용품 구매", -45000, "대기"])
+        wb.save(str(demo_path / "sales_2024.xlsx"))
+        print(f"  ✓ {'sales_2024.xlsx':25s}  \"[Excel 문서] 2024 연간 매출 및 호스팅 지출\"")
+    except Exception as e:
+        print(f"  ⚠️ Excel 파일 생성 생략 ({e})")
+
+    try:
+        from PIL import Image
+        img = Image.new("RGB", (640, 480), color=(240, 180, 190))
+        img.save(str(demo_path / "vacation_kyoto.jpg"))
+        print(f"  ✓ {'vacation_kyoto.jpg':25s}  \"[이미지] 교토 벚꽃 사진 (640x480)\"")
+    except Exception as e:
+        print(f"  ⚠️ 이미지 파일 생성 생략 ({e})")
+
+    total_files = len(list(demo_path.glob("*.*")))
     print("─" * 55)
-    print(f"\n✅ {len(DEMO_FILES)}개 파일 생성 완료! (파일명은 의도적으로 모호하게 설정)")
+    print(f"\n✅ {total_files}개 파일 생성 완료! (텍스트 + Word + Excel + CSV + 이미지)")
     print(f"\n예상 분류:")
     print(f"  🍳 Recipes/    3개 — 티라미수, 된장찌개, 아보카도 토스트")
     print(f"  ✈️  Travel/     3개 — 교토, 바르셀로나, 오사카")

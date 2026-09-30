@@ -4,6 +4,8 @@ import argparse
 import sys
 import time
 import threading
+import re
+import uuid
 
 # 환경 변수 로드 (.env 파일이 있으면 여기서 로드됨)
 from dotenv import load_dotenv
@@ -26,8 +28,37 @@ from interfaces import watcher
 
 console = Console()
 
-MODEL = "gpt-4o"
-MAX_TOKENS = 4096
+def get_current_provider_and_model():
+    provider = os.getenv("LLM_PROVIDER", "ollama").lower()
+    default_model = "qwen2.5:14b" if provider == "ollama" else "gpt-4o"
+    model = os.getenv("LLM_MODEL", default_model)
+    return provider, model
+
+def get_llm(json_mode: bool = False):
+    """LLM 프로바이더(ollama/openai)에 따라 ChatOpenAI 호환 객체를 반환합니다."""
+    provider, model = get_current_provider_and_model()
+    if provider == "ollama":
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        kwargs = {
+            "model": model,
+            "base_url": base_url,
+            "api_key": "ollama",
+            "temperature": 0,
+            "extra_body": {"num_ctx": 8192},
+        }
+        if json_mode:
+            kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+        return ChatOpenAI(**kwargs)
+    elif provider == "openai":
+        kwargs = {
+            "model": model,
+            "temperature": 0,
+        }
+        if json_mode:
+            kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+        return ChatOpenAI(**kwargs)
+    else:
+        return ChatOpenAI(model=model, temperature=0)
 
 # ══════════════════════════════════════════════════════
 # 1. 파일 정리 전담 에이전트 프롬프트 (FILE_ORGANIZER)
@@ -41,15 +72,18 @@ FILE_ORGANIZER_PROMPT = """당신은 파일의 내용을 읽고 카테고리별�
 - 절대로 가상환경 활성화 없이 pip install이나 python 명령어를 실행하지 마세요.
 
 ## 작업 순서 (파일 이동/분류 요청 시)
-1. `tool_list_directory`로 대상 폴더의 파일 목록 파악
-2. 각 파일을 `tool_read_file`로 내용 확인 (확장자가 아닌 내용으로 판단)
-3. 필요 시 `tool_create_directory`로 분류용 하위 폴더를 먼저 생성
-4. 내용 기반으로 카테고리 결정 (요약 내용 및 태그 도출)
-5. `tool_propose_file_organization`으로 분류 폴더로 이동 제안
-6. 모든 파일 처리 후 `tool_summarize_directory`로 최종 결과 보고
+1. `tool_scan_directory_contents`를 가장 먼저 호출하여 대상 디렉토리 내 모든 파일의 내용 미리보기를 일괄 스캔하세요. (한 번의 호출로 모든 파일의 핵심 내용과 형식을 즉시 파악할 수 있어 가장 빠르고 효율적입니다.)
+2. 스캔한 파일들의 분류 계획을 `tool_propose_batch_organization`을 호출하여 한 번에 일괄 등록하세요! (가장 빠르고 강력히 권장됩니다. 파일들을 하나씩 따로 등록하지 말고, `items` 리스트에 담아 한 번에 전달하세요.)
+3. 제안 등록이 완료되면 `tool_summarize_directory`를 호출하여 작업을 완료하세요.
 
 ## 작업 순서 (시스템 제어 / 백그라운드 구동 등 관리자 명령어 요청 시)
 - 사용자가 "백그라운드로 띄워줘", "감시 시작해줘", "이 스크립트 실행해줘" 등을 요구할 경우 `tool_execute_cli_command` 도구를 사용하여 즉각 터미널(CLI) 명령어를 백그라운드 등에서 실행하고 그 출력을 제공하세요.
+
+## [가장 중요: 사용자 요청 범위 및 Others 폴더 금지 규칙]
+- 사용자가 특정 카테고리나 특정 파일만 지정하여 요청한 경우 (예: "레시피만 모아줘", "여행 관련 파일만 정리해줘", "파이썬 코드만 옮겨줘"):
+  - [절대 금지] 요청과 무관한 파일들을 'Others/' 폴더나 기타 폴더로 절대 이동 제안하지 마세요!
+  - 오직 사용자가 요구한 대상 파일들만 제안 목록에 등록하고, 나머지 파일들은 제안에 포함하지 않고 원래 위치에 그대로 두어야 합니다.
+- 전체 정리를 명시적으로 요청했을 때(예: "전체 파일을 주제별로 전부 분류해줘")에만 모든 파일을 적절한 카테고리로 나누세요.
 
 ## 카테고리 및 네이밍 규칙
 [중요] 같은 카테고리의 파일은 반드시 동일한 prefix와 형식을 사용하세요.
@@ -61,14 +95,16 @@ FILE_ORGANIZER_PROMPT = """당신은 파일의 내용을 읽고 카테고리별�
 - Finance/  → finance_
 - Health/   → health_
 - Books/    → book_
-- Others/   → other_
+- Others/   → other_ (전체 정리 요청 시에만 사용)
 
 ## 주의사항
-- [핵심] 도구를 직접 호출하기 전에, 항상 당신이 지금 어떤 판단(추론 과정)을 해서 이 도구를 부르는지 짧게 글로 설명하세요.
+- [멀티모달 지원] 텍스트(.txt, .md, .py)뿐만 아니라 Word(.docx), Excel(.xlsx), CSV(.csv), PDF(.pdf), 이미지(.jpg, .png)도 `tool_read_file`로 본문과 메타데이터를 모두 파싱할 수 있으니 모든 확장자의 파일을 `tool_read_file`로 읽고 분석하세요.
+- [핵심: 도구 연속 호출] 작업이 진행 중일 때는 텍스트만 출력하고 멈추지 마세요. 판단 후 반드시 필요한 도구(`tool_read_file`, `tool_propose_file_organization` 등)를 실제로 호출해야 다음 단계로 진행됩니다.
+- [도구 호출 형식] 도구를 호출할 때는 반드시 시스템 Function Call 메커니즘을 사용하세요. 텍스트로 도구 호출을 흉내내거나 멈추지 마세요.
 - 파일 하나당 반드시 `tool_propose_file_organization` 도구(Tool)를 실제로 "호출(Call)"하여 시스템에 등록하세요.
 - 사용자에게 텍스트로 "실행할까요?"라고 묻지 마세요. 도구를 호출하면 시스템이 알아서 승인을 받습니다.
 - 목적지에 이미 같은 이름의 파일이 있다는 에러가 나면 스스로 파일명을 바꿔 `tool_propose_file_organization`을 다시 호출하세요.
-- 완료 시 `tool_summarize_directory`를 호출하여 종료하세요.
+- 모든 파일에 대한 제안이 완료되면 `tool_summarize_directory`를 호출하여 종료하세요.
 """
 
 # ══════════════════════════════════════════════════════
@@ -107,8 +143,9 @@ SUPERVISOR_PROMPT = """당신은 사용자의 요청을 분석하여 적절한 �
 def print_banner():
     banner = Text()
     banner.append("🗂️  File Organizer Agent", style="bold cyan")
-    banner.append("  v2", style="bold yellow")
     banner.append("\n    내용 기반 분류 + 일관된 제목 변경", style="dim")
+    provider, model = get_current_provider_and_model()
+    banner.append(f"\n    [LLM 엔진: {provider.upper()} ({model})]", style="magenta")
     console.print(Panel(banner, border_style="cyan", padding=(1, 4)))
 
 
@@ -177,15 +214,21 @@ class AgentState(TypedDict):
 
 def run_supervisor(user_request: str) -> str:
     """사용자 요청을 분석하여 적절한 Worker Agent를 선택합니다."""
-    # ... 기존 프롬프트와 ChatOpenAI 로직을 그대로 사용 ...
-    client = ChatOpenAI(model=MODEL, temperature=0, model_kwargs={"response_format": {"type": "json_object"}})
+    client = get_llm(json_mode=True)
     console.print("\n[dim]🕵️ 수퍼바이저(Supervisor)가 업무를 배분 중입니다...[/dim]")
     try:
         response = client.invoke([
             SystemMessage(content=SUPERVISOR_PROMPT),
             HumanMessage(content=user_request)
         ])
-        decision = json.loads(response.content)
+        content = response.content.strip()
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        if "{" in content and "}" in content:
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            content = content[start:end]
+        decision = json.loads(content)
         agent_type = decision.get("agent", "FILE_ORGANIZER")
         console.print(f"[bold magenta]👉 라우팅 결정: {agent_type} 에이전트로 작업을 전달합니다.[/bold magenta]")
         return agent_type
@@ -194,12 +237,95 @@ def run_supervisor(user_request: str) -> str:
         return "FILE_ORGANIZER"
 
 
+def extract_fallback_tool_calls(content: str, valid_tool_names: set[str]) -> list[dict]:
+    """오픈소스 LLM(Qwen 등)이 텍스트로 도구 호출 마크다운을 누출했을 때 복구"""
+    recovered = []
+    
+    # 1. 'gc ... 'gc 패턴
+    for m in re.finditer(r"'gc\s*(\{.*?\})\s*'gc", content, re.DOTALL):
+        try:
+            data = json.loads(m.group(1))
+            name = data.get("name")
+            args = data.get("arguments") or data.get("args") or {}
+            if name in valid_tool_names:
+                recovered.append({
+                    "name": name,
+                    "args": args,
+                    "id": f"call_rec_{uuid.uuid4().hex[:8]}",
+                    "type": "tool_call"
+                })
+        except Exception:
+            pass
+
+    # 2. <tool_call> ... </tool_call> 패턴
+    for m in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", content, re.DOTALL):
+        try:
+            data = json.loads(m.group(1))
+            name = data.get("name")
+            args = data.get("arguments") or data.get("args") or {}
+            if name in valid_tool_names:
+                recovered.append({
+                    "name": name,
+                    "args": args,
+                    "id": f"call_rec_{uuid.uuid4().hex[:8]}",
+                    "type": "tool_call"
+                })
+        except Exception:
+            pass
+
+    # 3. ```json ... ``` 패턴
+    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL):
+        try:
+            data = json.loads(m.group(1))
+            name = data.get("name")
+            args = data.get("arguments") or data.get("args") or {}
+            if name in valid_tool_names:
+                recovered.append({
+                    "name": name,
+                    "args": args,
+                    "id": f"call_rec_{uuid.uuid4().hex[:8]}",
+                    "type": "tool_call"
+                })
+        except Exception:
+            pass
+
+    # 4. 일반 텍스트 내 단독 JSON 객체 탐색
+    if not recovered:
+        for tool_name in valid_tool_names:
+            if tool_name in content:
+                pattern = rf'(\{{\s*"name"\s*:\s*"{tool_name}".*?\}})'
+                for m in re.finditer(pattern, content, re.DOTALL):
+                    try:
+                        data = json.loads(m.group(1))
+                        args = data.get("arguments") or data.get("args") or {}
+                        recovered.append({
+                            "name": tool_name,
+                            "args": args,
+                            "id": f"call_rec_{uuid.uuid4().hex[:8]}",
+                            "type": "tool_call"
+                        })
+                    except Exception:
+                        pass
+
+    return recovered
+
+
 def custom_agent_node(state: AgentState):
-    llm = ChatOpenAI(model=MODEL, temperature=0).bind_tools(core_tools.ALL_TOOLS)
-    console.print("[dim]... GPT 라우팅 판단 중 ...[/dim]")
-    response = llm.invoke(state["messages"])
+    provider, model = get_current_provider_and_model()
+    llm = get_llm().bind_tools(core_tools.ALL_TOOLS)
+    with console.status(f"[bold cyan]🤖 [{provider.upper()}:{model}] 파일 내용을 분석하고 분류 계획을 수립하고 있습니다...[/bold cyan]", spinner="dots"):
+        response = llm.invoke(state["messages"])
     if response.content:
         console.print(f"\n  💭 [cyan]{response.content.strip()}[/cyan]")
+    
+    # 오픈소스 LLM 텍스트 누출 도구 호출 복구
+    if not getattr(response, "tool_calls", None) and response.content:
+        valid_tools = {t.name for t in core_tools.ALL_TOOLS}
+        recovered = extract_fallback_tool_calls(response.content, valid_tools)
+        if recovered:
+            response.tool_calls = recovered
+            console.print(f"  [dim]🛠️ 텍스트에서 {len(recovered)}개의 도구 호출을 복구했습니다.[/dim]")
+
     return {"messages": [response]}
 
 
@@ -214,7 +340,10 @@ def custom_tool_node(state: AgentState):
         
         tool_impl = next((t for t in core_tools.ALL_TOOLS if t.name == func_name), None)
         if tool_impl:
-            result = str(tool_impl.invoke(func_args))
+            try:
+                result = str(tool_impl.invoke(func_args))
+            except Exception as e:
+                result = f"오류: '{func_name}' 도구 실행 실패 ({type(e).__name__}): {e}"
         else:
             result = f"오류: '{func_name}' 도구를 찾을 수 없습니다"
             
@@ -240,10 +369,65 @@ GRAPH_WORKFLOW.add_edge("tools", "agent")
 compiled_graph = GRAPH_WORKFLOW.compile()
 
 
+def extract_category_from_text(text: str, user_request: str = "") -> str:
+    """텍스트 및 사용자 요청에서 실제 카테고리명을 스마트하게 도출 (지시대명사 배제)"""
+    category_map = [
+        (["recipe", "recipes", "레시피", "요리", "쿠킹", "음식"], "Recipes"),
+        (["travel", "여행", "휴가", "관광"], "Travel"),
+        (["dev", "개발", "프로그래밍", "코드", "코딩"], "Dev"),
+        (["finance", "재무", "가계부", "회계", "지출", "비용", "청구"], "Finance"),
+        (["health", "건강", "운동", "루틴", "단식"], "Health"),
+        (["book", "books", "독서", "책", "도서"], "Books"),
+    ]
+    combined = (user_request + " " + text).lower()
+    for keywords, cat in category_map:
+        if any(kw in combined for kw in keywords):
+            return cat
+
+    invalid_words = {"해당", "이", "그", "저", "위", "다음", "아래", "어떤", "지정된", "관련", "대상", "새로운", "임의의"}
+    matches = re.findall(r'([A-Za-z0-9_가-힣]+)\s*폴더', text)
+    for m in matches:
+        if m not in invalid_words:
+            return m
+
+    return "Others"
+
+
+def parse_text_proposals(text: str, target_dir: str, user_request: str = "") -> list[dict]:
+    """오픈소스 LLM이 도구 호출 대신 한국어 텍스트로 파일 목록과 대상 폴더를 나열했을 때 계획 복구"""
+    proposals = []
+    default_cat = extract_category_from_text(text, user_request)
+    
+    lines = text.split("\n")
+    for line in lines:
+        m = re.search(r'[-*•]?\s*([a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9]+)\s*[:\-]?\s*(.*)', line.strip())
+        if m:
+            fn, summary = m.group(1), m.group(2).strip()
+            src_path = os.path.join(os.path.abspath(target_dir), fn)
+            if os.path.exists(src_path):
+                if any(p["source"] == src_path for p in core_tools.PROPOSALS) or any(p["source"] == src_path for p in proposals):
+                    continue
+                prefix = default_cat.lower().rstrip("s") + "_"
+                ext = os.path.splitext(fn)[1]
+                safe_name = re.sub(r'[^a-zA-Z0-9가-힣_]', '', summary.split()[0]) if summary else ""
+                new_fn = f"{prefix}{safe_name}{ext}" if safe_name else fn
+                proposals.append({
+                    "source": src_path,
+                    "destination_dir": os.path.join(os.path.abspath(target_dir), default_cat),
+                    "new_filename": new_fn,
+                    "category": default_cat,
+                    "summary": summary or fn,
+                    "tags": [default_cat],
+                    "extracted_terms": {}
+                })
+    return proposals
+
+
 def run_agent(user_request: str, target_dir: str, session_messages: list = None, agent_type: str = "FILE_ORGANIZER"):
     """LangGraph 기반 Agentic Loop"""
     
     if session_messages is None:
+        core_tools.PROPOSALS.clear()
         system_prompt = RAG_EXTRACTOR_PROMPT if agent_type == "RAG_EXTRACTOR" else FILE_ORGANIZER_PROMPT
         session_messages = [
             SystemMessage(content=system_prompt),
@@ -265,6 +449,16 @@ def run_agent(user_request: str, target_dir: str, session_messages: list = None,
     # LangGraph 호출
     final_state = compiled_graph.invoke({"messages": session_messages})
     
+    # 텍스트로만 나열하고 도구 호출을 깜빡한 경우 자동 복구
+    if not core_tools.PROPOSALS:
+        for msg in reversed(final_state["messages"]):
+            if getattr(msg, "content", None):
+                recovered = parse_text_proposals(msg.content, target_dir, user_request)
+                if recovered:
+                    core_tools.PROPOSALS.extend(recovered)
+                    console.print(f"\n[bold green]💡 AI 응답 텍스트에서 {len(recovered)}개의 정리 계획을 자동 감지하여 등록했습니다.[/bold green]")
+                    break
+
     console.rule("[dim]LangGraph 실행 완료[/dim]")
     return final_state["messages"]
 
@@ -283,14 +477,42 @@ def execute_all_pending_proposals(*, announce: bool = True) -> int:
     return n
 
 
-def review_and_execute_proposals() -> str:
+def review_and_execute_proposals(use_tui: bool = True) -> str:
     """제안된 목록을 보여주고, 승인 시 실행(Human-in-the-loop)
+    TUI 모드 지원 (터미널 환경 시), 미지원 시 텍스트 모드 fallback.
     반환값: "EXECUTED", "CANCELLED", 또는 피드백 텍스트(문자열)
     """
     if not core_tools.PROPOSALS:
         console.print("\n[dim]현재 실행할 제안이 없습니다.[/dim]")
         return "EXECUTED"
-        
+
+    # 1. Textual TUI 모드 (터미널 지원 시 기본 활성화)
+    if use_tui and sys.stdin.isatty():
+        try:
+            from interfaces.tui import launch_tui_review
+            action, selected = launch_tui_review(core_tools.PROPOSALS)
+            if action == "EXECUTED":
+                if not selected:
+                    console.print("\n[yellow]선택된 제안 항목이 없습니다. (실행 건너뜀)[/yellow]")
+                    core_tools.PROPOSALS.clear()
+                    return "EXECUTED"
+                console.print(f"\n[bold green]선택된 {len(selected)}개 항목 실행을 시작합니다...[/bold green]")
+                core_tools.PROPOSALS = selected
+                execute_all_pending_proposals(announce=False)
+                console.print("\n[bold cyan]🎉 처리가 완료되었습니다. (되돌리려면 --undo 옵션을 사용하세요)[/bold cyan]")
+                return "EXECUTED"
+            elif action == "CANCELLED":
+                console.print("\n[yellow]실행이 취소되었습니다.[/yellow]")
+                core_tools.PROPOSALS.clear()
+                return "CANCELLED"
+            else:
+                # 수정 재지시 피드백
+                core_tools.PROPOSALS.clear()
+                return action
+        except Exception as e:
+            console.print(f"[dim]TUI 실행 불가 ({e}), 텍스트 콘솔 모드로 전환합니다.[/dim]")
+
+    # 2. 텍스트 콘솔 Fallback 모드
     table = Table(title="📋 AI 이동/분류/추출 제안 목록 (실행 대기중)")
     table.add_column("No", justify="right", style="cyan")
     table.add_column("원본 파일명", style="magenta")
@@ -328,7 +550,7 @@ def review_and_execute_proposals() -> str:
         # 사용자가 피드백을 입력한 경우
         return choice
 
-def run_interactive_agent_loop(request: str, target: str):
+def run_interactive_agent_loop(request: str, target: str, use_tui: bool = True):
     """피드백 루프를 처리하는 래퍼 함수"""
     agent_type = run_supervisor(request)
     session = None
@@ -336,7 +558,7 @@ def run_interactive_agent_loop(request: str, target: str):
     
     while True:
         session = run_agent(curr_req, target, session_messages=session, agent_type=agent_type)
-        feedback = review_and_execute_proposals()
+        feedback = review_and_execute_proposals(use_tui=use_tui)
         
         if feedback in ["EXECUTED", "CANCELLED"]:
             break
@@ -431,6 +653,13 @@ def watch_mode(
         console.print("\n[dim]감시가 종료되었습니다.[/dim]")
 
 
+def apply_field_mask(proposals: list[dict], fields: list[str] | None) -> list[dict]:
+    """에이전트 컨텍스트 창 절약을 위한 필드 마스크 필터링"""
+    if not fields:
+        return proposals
+    return [{k: p[k] for k in fields if k in p} for p in proposals]
+
+
 def main():
     parser = argparse.ArgumentParser(description="File Organizer AI Agent v2")
     parser.add_argument("--watch", "-w", action="store_true", help="지정된 폴더를 실시간 감시 모드로 실행합니다.")
@@ -441,8 +670,56 @@ def main():
     parser.add_argument("--output", choices=["text", "json", "ndjson"], default="text", help="출력 형식을 지정합니다.")
     parser.add_argument("--schema", action="store_true", help="이 CLI의 입력 및 출력 설명에 대한 JSON Schema를 반환합니다.")
     parser.add_argument("--dry-run", action="store_true", help="실제 파일을 이동/변경하지 않고 계획만 생성/출력합니다.")
+    parser.add_argument("--provider", choices=["ollama", "openai"], default=None, help="사용할 LLM 프로바이더 (기본값: .env 설정 또는 ollama).")
+    parser.add_argument("--model", type=str, default=None, help="사용할 모델명 (예: qwen2.5:14b, gpt-4o).")
+    parser.add_argument("--fields", type=str, default=None, help="출력 JSON/NDJSON에서 포함할 필드 마스크 (쉼표 구분, 예: 'source,new_filename,category').")
+    parser.add_argument("--search", type=str, default=None, help="정리된 파일 내용 및 메타데이터를 자연어로 시맨틱 검색합니다.")
+    parser.add_argument("--index", type=str, nargs="?", const=".", default=None, help="지정된 디렉토리의 파일들을 시맨틱 검색용으로 일괄 색인화합니다 (기본값: 현재 디렉토리).")
+    parser.add_argument("--no-tui", action="store_true", help="인터랙티브 모드에서 Textual TUI를 비활성화하고 기본 텍스트 콘솔을 사용합니다.")
     
     args = parser.parse_args()
+
+    if args.provider:
+        os.environ["LLM_PROVIDER"] = args.provider
+    if args.model:
+        os.environ["LLM_MODEL"] = args.model
+
+    # 1. 시맨틱 검색 실행
+    if args.search:
+        from core import search
+        query = args.search
+        console.print(f"\n🔍 [bold cyan]'{query}' 시맨틱 검색 중...[/bold cyan]")
+        results = search.search_documents(query)
+        if not results:
+            console.print("[yellow]검색 결과가 없습니다. 먼저 디렉토리를 색인화해보세요: python agent.py --index [폴더경로][/yellow]")
+        else:
+            table = Table(title=f"🔎 검색 결과: '{query}'")
+            table.add_column("순위", justify="right", style="cyan")
+            table.add_column("파일명", style="magenta")
+            table.add_column("카테고리", style="blue")
+            table.add_column("관련도", justify="right", style="green")
+            table.add_column("내용 요약", style="yellow")
+            table.add_column("파일 경로", style="dim")
+            for i, r in enumerate(results):
+                table.add_row(
+                    str(i + 1),
+                    r["filename"],
+                    r["category"],
+                    f"{int(r['score'] * 100)}%",
+                    r["summary"][:60],
+                    r["path"]
+                )
+            console.print(table)
+        sys.exit(0)
+
+    # 2. 일괄 색인화(Indexing) 실행
+    if args.index:
+        from core import search
+        target = args.index
+        console.print(f"\n📚 [bold cyan]'{target}' 디렉토리 문서 색인화 중...[/bold cyan]")
+        n = search.index_directory(target)
+        console.print(f"✅ [bold green]총 {n}개 파일 색인화 완료![/bold green] (이제 --search 로 검색 가능)")
+        sys.exit(0)
 
     # json이나 ndjson 포맷 출력을 요청받았다면, 터미널 꾸밈 요소 출력을 끕니다.
     if args.output in ["json", "ndjson"] or args.schema:
@@ -469,9 +746,39 @@ def main():
                         "type": "string",
                         "enum": ["FILE_ORGANIZER", "RAG_EXTRACTOR"],
                         "description": "요청을 처리할 에이전트 종류. 알 수 없는 경우 생략하면 스스로 결정."
+                    },
+                    "provider": {
+                        "type": "string",
+                        "enum": ["ollama", "openai"],
+                        "description": "사용할 LLM 프로바이더 (ollama 또는 openai)"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "사용할 모델명 (예: qwen2.5:14b, gpt-4o)"
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "컨텍스트 창 절약을 위한 반환 필드 마스크 목록 (예: ['source', 'destination_dir', 'new_filename'])"
                     }
                 },
                 "required": ["request", "target_dir"]
+            },
+            "returns": {
+                "type": "array",
+                "description": "생성된 파일 이동 및 정리 제안(Proposal) 목록",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string", "description": "원본 파일 절대 경로"},
+                        "destination_dir": {"type": "string", "description": "이동할 대상 디렉토리 경로"},
+                        "new_filename": {"type": "string", "description": "변경될 새 파일명"},
+                        "category": {"type": "string", "description": "분류된 카테고리"},
+                        "summary": {"type": "string", "description": "파일 내용 요약"},
+                        "tags": {"type": "array", "items": {"type": "string"}, "description": "연관 태그 목록"},
+                        "extracted_terms": {"type": "object", "description": "RAG 추출 전문 용어 사전"}
+                    }
+                }
             }
         }
         # json 출력이므로 quiet를 해제하거나 sys.stdout.write 로 출력
@@ -491,7 +798,22 @@ def main():
         target = payload.get("target_dir")
         request = payload.get("request")
         agent_type = payload.get("agent_type")
+        if payload.get("provider"):
+            os.environ["LLM_PROVIDER"] = payload["provider"]
+        if payload.get("model"):
+            os.environ["LLM_MODEL"] = payload["model"]
         
+        # 필드 마스크 추출 (CLI 옵션 우선, JSON 페이로드 차선)
+        fields = None
+        if args.fields:
+            fields = [f.strip() for f in args.fields.split(",") if f.strip()]
+        elif payload.get("fields"):
+            raw_fields = payload.get("fields")
+            if isinstance(raw_fields, list):
+                fields = [str(f).strip() for f in raw_fields if str(f).strip()]
+            elif isinstance(raw_fields, str):
+                fields = [f.strip() for f in raw_fields.split(",") if f.strip()]
+
         if not target or not request:
             sys.stderr.write(json.dumps({"error": "Missing required fields: target_dir, request"}) + "\n")
             sys.exit(1)
@@ -502,11 +824,12 @@ def main():
         # 에이전트 실행
         run_agent(request, target, session_messages=None, agent_type=agent_type)
         
-        # 출력 형식이 JSON / NDJSON 인 경우
+        # 출력 형식이 JSON / NDJSON 인 경우 필드 마스킹 적용
+        output_proposals = apply_field_mask(core_tools.PROPOSALS, fields)
         if args.output == "json":
-            sys.stdout.write(json.dumps(core_tools.PROPOSALS, ensure_ascii=False, indent=2) + "\n")
+            sys.stdout.write(json.dumps(output_proposals, ensure_ascii=False, indent=2) + "\n")
         elif args.output == "ndjson":
-            for p in core_tools.PROPOSALS:
+            for p in output_proposals:
                 sys.stdout.write(json.dumps(p, ensure_ascii=False) + "\n")
 
         # dry-run이 아니면 실제 실행
@@ -533,12 +856,16 @@ def main():
         sys.exit(0)
 
     console.print("\n[bold]정리할 디렉토리 경로를 입력하세요[/bold]")
-    console.print("[dim](Enter = 현재 디렉토리)[/dim]")
+    console.print("[dim](Enter = 현재 디렉토리, q = 종료)[/dim]")
     
     attempts = 0
     target = ""
     while attempts < 3:
-        target = input("  📂 경로: ").strip() or "."
+        raw_target = input("  📂 경로: ").strip()
+        if raw_target.lower() in ["q", "quit", "exit", "취소", ":q"]:
+            console.print("\n[dim]프로그램을 종료합니다.[/dim]")
+            sys.exit(0)
+        target = raw_target or "."
         
         # 한국어 음성/오타 보정기 (데모 전용)
         if target.replace(" ", "") in ["데모폴더", "데포폴더", "데모폴더줘", "demo", "데모", "demo_folder"]:
@@ -556,8 +883,12 @@ def main():
         return
 
     console.print("\n[bold]어떻게 정리할까요?[/bold]")
-    console.print("[dim](Enter = 기본 요청 사용)[/dim]")
+    console.print("[dim](Enter = 기본 요청 사용, q = 종료)[/dim]")
     request = input("  💬 요청: ").strip()
+
+    if request.lower() in ["q", "quit", "exit", "취소", ":q"]:
+        console.print("\n[dim]작업을 취소하고 프로그램을 종료합니다.[/dim]")
+        sys.exit(0)
 
     if not request:
         request = "파일 내용을 읽고 카테고리를 파악해서 적절한 폴더로 분류하고, 같은 분류의 파일들은 일관된 네이밍 규칙으로 제목을 수정해줘."
@@ -565,7 +896,7 @@ def main():
     if args.watch:
         watch_mode(target, request)
     else:
-        run_interactive_agent_loop(request, target)
+        run_interactive_agent_loop(request, target, use_tui=not args.no_tui)
 
 if __name__ == "__main__":
     main()

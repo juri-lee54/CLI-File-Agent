@@ -15,12 +15,16 @@ if not os.path.exists(CLI_PYTHON):
 
 
 @mcp.tool()
-def organize_files_dry_run(request: str, target_dir: str) -> str:
-    """파일을 실제로 이동하지 않고, 정리 계획(가상 실행 결과)만 생성하여 반환합니다."""
+def organize_files_dry_run(request: str, target_dir: str, fields: str = None) -> str:
+    """파일을 실제로 이동하지 않고, 정리 계획(가상 실행 결과)만 생성하여 반환합니다.
+    fields: 반환할 필드 마스크 (쉼표 구분 문자열, 예: 'source,destination_dir,new_filename')
+    """
     payload = {
         "request": request,
         "target_dir": target_dir
     }
+    if fields:
+        payload["fields"] = fields
     
     cmd = [
         CLI_PYTHON,

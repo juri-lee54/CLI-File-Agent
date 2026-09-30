@@ -2,7 +2,11 @@ import json
 import os
 
 def save_metadata(directory: str, filename: str, category: str, summary: str, tags: list, extracted_terms: dict = None):
-    """해당 폴더의 .agent_metadata.json에 파일 메타데이터를 누적 기록합니다."""
+    """해당 폴더(또는 상위 루트)의 .agent_metadata.json에 파일 메타데이터를 누적 기록합니다."""
+    parent = os.path.dirname(os.path.abspath(directory))
+    if os.path.basename(directory) in ["Recipes", "Travel", "Dev", "Finance", "Health", "Books", "Others", "Cooking", "Documents", "Images"]:
+        directory = parent
+
     os.makedirs(directory, exist_ok=True)
     db_path = os.path.join(directory, ".agent_metadata.json")
     

@@ -1,6 +1,7 @@
 .env
-*/__pycache__/
+__pycache__/
 .venv/
+demo_folder/
 .env.*
 !.env.example
 .DS_Store
