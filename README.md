@@ -67,6 +67,15 @@ LLM_MODEL="gpt-4o"
 OPENAI_API_KEY="sk-여러분들의-발급받은-키"
 ```
 
+
+### 3. MCP 클라이언트 설정
+
+`mcp_settings.json`은 공유용 설정 예시입니다. `/path/to/CLI-File-Agent`를 실제 설치 폴더의 절대 경로로 바꾼 뒤 MCP 클라이언트에 등록하세요. `command`는 해당 가상 환경의 Python 실행 파일을 가리켜야 합니다. Windows에서는 `.venv/Scripts/python.exe`를 사용하세요.
+
+개인 경로를 넣은 설정은 Git에서 제외되는 `mcp_settings.local.json`에 저장하세요. 이 파일은 MCP 클라이언트가 자동으로 읽지 않으므로, 클라이언트의 설정 화면에서 직접 등록해야 합니다.
+
+`.env`와 `.env.*`(공유용 `.env.example` 제외), 파일 이동 기록(`.agent_history.json`), 추출 메타데이터(`.agent_metadata.json`), Finder 메타데이터(`.DS_Store`)도 Git에서 제외됩니다. 실제 키나 개인 파일 정보를 공유용 예시 파일에 넣지 마세요.
+
 ---
 
 ## 사용 방법
